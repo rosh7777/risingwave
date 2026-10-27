@@ -16,13 +16,18 @@
 //! The event handler owns and updates this state; refill tasks consume immutable snapshots.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::config::Role;
 use risingwave_common::config::streaming::CacheRefillPolicy;
 use risingwave_pb::id::TableId;
 
 use super::refill_locality::RefillOwnership;
+
+/// Lock order: metadata, Pin pending queue, executor/cache locks. Never hold across I/O or await.
+pub(crate) type SharedTableCacheMetadata = Arc<RwLock<TableCacheMetadata>>;
 
 pub(crate) struct TableCacheMetadata {
     pub role: Role,

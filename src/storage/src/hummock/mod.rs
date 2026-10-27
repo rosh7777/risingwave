@@ -42,7 +42,6 @@ pub mod backup_reader;
 pub mod event_handler;
 pub mod local_version;
 pub mod observer_manager;
-// The backend is exercised by component tests before production wiring in the final stack layer.
 pub(crate) mod pin_cache;
 pub(crate) mod pin_cache_refill;
 pub(crate) mod refill_locality;

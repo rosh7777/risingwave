@@ -399,20 +399,23 @@ impl HummockEventHandler {
             pinned.clear();
         }
         let changed = metadata.replace_policy_snapshot(policies, pinned);
-        self.refiller.on_metadata_changed(&changed, &metadata);
+        self.refiller
+            .invalidate_pin_refills(&changed, metadata.pinned_tables());
     }
 
     fn replace_serving_table_vnode_mapping(&mut self, mapping: HashMap<TableId, Bitmap>) {
         let mut metadata = self.cache_metadata.write();
         let changed = metadata.replace_serving_mapping(mapping);
-        self.refiller.on_metadata_changed(&changed, &metadata);
+        self.refiller
+            .invalidate_pin_refills(&changed, metadata.pinned_tables());
     }
 
     fn update_streaming_table_vnodes(&mut self, table: TableId) {
         let bitmap = self.streaming_table_vnodes(table);
         let mut metadata = self.cache_metadata.write();
         let changed = metadata.update_streaming_table_vnodes(table, bitmap);
-        self.refiller.on_metadata_changed(&changed, &metadata);
+        self.refiller
+            .invalidate_pin_refills(&changed, metadata.pinned_tables());
     }
 
     pub fn new(
@@ -1126,7 +1129,7 @@ impl SyncedData {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::future::poll_fn;
     use std::sync::Arc;
@@ -1142,14 +1145,10 @@ mod tests {
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::{EpochExt, test_epoch};
     use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-    use risingwave_hummock_sdk::compaction_group::hummock_version_ext::insert_new_sub_level;
     use risingwave_hummock_sdk::version::{
         GroupDelta, GroupDeltas, HummockVersion, HummockVersionDelta, IntraLevelDelta,
     };
-    use risingwave_pb::hummock::hummock_version::PbLevels;
-    use risingwave_pb::hummock::{
-        PbHummockVersion, PbLevelType, PbOverlappingLevel, StateTableInfo,
-    };
+    use risingwave_pb::hummock::{PbHummockVersion, StateTableInfo};
     use risingwave_pb::meta::serving_table_vnode_mappings::PbServingTableVnodeMapping;
     use risingwave_pb::meta::table_cache_refill_policies::PbTableCacheRefillPolicy;
     use risingwave_pb::meta::table_cache_refill_policies::table_cache_refill_policy::PbCacheRefillPolicy;
@@ -1185,6 +1184,136 @@ mod tests {
     use crate::mem_table::ImmutableMemtable;
     use crate::monitor::HummockStateStoreMetrics;
     use crate::store::SealCurrentEpochOptions;
+
+    /// Drives the real handler without running its select loop. Tests control backend progress.
+    pub(in crate::hummock::event_handler) struct RefillTest {
+        handler: HummockEventHandler,
+        instances: HashMap<TableId, super::LocalInstanceId>,
+    }
+
+    impl RefillTest {
+        pub(in crate::hummock::event_handler) fn new(
+            role: Role,
+            config: CacheRefillConfig,
+            store: crate::hummock::SstableStoreRef,
+            spawn: crate::hummock::event_handler::refiller::SpawnRefillTask,
+            version: PinnedVersion,
+        ) -> Self {
+            let metrics = Arc::new(HummockStateStoreMetrics::unused());
+            let membership = store
+                .pin_cache()
+                .map(|cache| PinCacheMembership::new(cache.clone(), version.clone()));
+            let metadata = Arc::new(parking_lot::RwLock::new(TableCacheMetadata::new(
+                role,
+                config.table_cache_refill_default_policy,
+            )));
+            let refiller =
+                CacheRefiller::new(config, store, ReadOnlyRwLockRef::new(metadata.clone()))
+                    .with_foyer_spawn_task(spawn);
+            Self {
+                handler: HummockEventHandler::new_inner(
+                    unbounded_channel().1,
+                    metrics.clone(),
+                    RecentVersions::new(version, 10, metrics),
+                    BufferTracker::for_test(),
+                    Arc::new(|_, _| panic!("refill tests must not upload")),
+                    refiller,
+                    metadata,
+                    membership,
+                ),
+                instances: HashMap::new(),
+            }
+        }
+
+        pub(in crate::hummock::event_handler) fn cache(&self) -> &CacheRefiller {
+            &self.handler.refiller
+        }
+
+        pub(in crate::hummock::event_handler) fn metadata(
+            &self,
+        ) -> &crate::hummock::table_cache_metadata::SharedTableCacheMetadata {
+            &self.handler.cache_metadata
+        }
+
+        pub(in crate::hummock::event_handler) fn versions(
+            &mut self,
+        ) -> &mut super::VersionUpdateQueue {
+            &mut self.handler.version_updates
+        }
+
+        pub(in crate::hummock::event_handler) fn replace_table_cache_refill_runtime_snapshot(
+            &mut self,
+            policies: HashMap<TableId, CacheRefillPolicy>,
+            pinned: HashSet<TableId>,
+        ) {
+            self.handler
+                .replace_table_cache_refill_runtime_snapshot(policies, pinned);
+        }
+
+        pub(in crate::hummock::event_handler) fn replace_serving_table_vnode_mapping(
+            &mut self,
+            mapping: HashMap<TableId, Bitmap>,
+        ) {
+            self.handler.replace_serving_table_vnode_mapping(mapping);
+        }
+
+        pub(in crate::hummock::event_handler) fn update_streaming_table_vnodes(
+            &mut self,
+            table: TableId,
+            bitmap: Option<Bitmap>,
+        ) {
+            let previous = self.instances.remove(&table);
+            if let Some(vnodes) = bitmap {
+                let (tx, mut rx) = oneshot::channel();
+                self.handler
+                    .handle_hummock_event(HummockEvent::RegisterReadVersion {
+                        table_id: table,
+                        new_read_version_sender: tx,
+                        is_replicated: false,
+                        vnodes: Arc::new(vnodes),
+                    });
+                let (_, mut guard) = rx.try_recv().unwrap();
+                // This fixture explicitly delivers destruction below instead of running the loop.
+                guard.event_sender.take();
+                self.instances.insert(table, guard.instance_id);
+            }
+            if let Some(instance_id) = previous {
+                self.handler
+                    .handle_hummock_event(HummockEvent::DestroyReadVersion { instance_id });
+            }
+        }
+
+        pub(in crate::hummock::event_handler) fn submit(
+            &mut self,
+            deltas: Vec<HummockVersionDelta>,
+        ) {
+            self.handler
+                .handle_version_update(HummockVersionUpdate::VersionDeltas(deltas));
+        }
+
+        pub(in crate::hummock::event_handler) fn receive_snapshot(
+            &mut self,
+            version: HummockVersion,
+        ) {
+            self.handler
+                .handle_version_update(HummockVersionUpdate::PinnedVersion(Box::new(version)));
+        }
+
+        pub(in crate::hummock::event_handler) fn publish(
+            &mut self,
+            events: &[super::VersionUpdateEvent],
+        ) {
+            self.handler.publish_version_updates(
+                events
+                    .iter()
+                    .map(|event| super::VersionUpdateEvent {
+                        prev_version_id: event.prev_version_id,
+                        new_pinned_version: event.new_pinned_version.clone(),
+                    })
+                    .collect(),
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_version_updates_wait_for_foyer_and_publish_in_order() {
@@ -1411,87 +1540,38 @@ mod tests {
                 .unwrap()
                 .with_pin_cache(cache.clone()),
         );
-        let mut initial = HummockVersion::from_rpc_protobuf(&PbHummockVersion {
-            id: 1.into(),
-            levels: [(
-                group,
-                PbLevels {
-                    group_id: group,
-                    l0: Some(PbOverlappingLevel::default()),
-                    ..Default::default()
-                },
-            )]
-            .into(),
-            state_table_info: [table, ordinary_table]
-                .into_iter()
-                .map(|table| {
-                    (
-                        table,
-                        StateTableInfo {
-                            compaction_group_id: group,
-                            committed_epoch: test_epoch(1),
-                        },
-                    )
-                })
-                .collect(),
-            ..Default::default()
-        });
-        insert_new_sub_level(
-            &mut initial.levels.get_mut(&group).unwrap().l0,
-            1,
-            PbLevelType::Overlapping,
-            vec![input.clone()],
-            None,
+        let initial = crate::hummock::event_handler::refiller::test_utils::pinned_version_with_ssts(
+            &[table, ordinary_table],
+            std::slice::from_ref(&input),
         );
-        let initial = PinnedVersion::new(initial, unbounded_channel().0);
-        let metrics = Arc::new(HummockStateStoreMetrics::unused());
         let options = default_opts_for_test();
-        let (spawn_upload_task, _) = prepare_uploader_order_test_spawn_task_fn(false);
         let foyer_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let worker_gate = foyer_gate.clone();
-        let (_observer_tx, observer_rx) = unbounded_channel();
         let refill_config = CacheRefillConfig::from_storage_opts(&options);
-        let refill_store = store;
-        let refill_version = initial.clone();
-        let pin_membership = refill_store
-            .pin_cache()
-            .map(|cache| PinCacheMembership::new(cache.clone(), refill_version));
-        let cache_metadata = Arc::new(parking_lot::RwLock::new(TableCacheMetadata::new(
-            Role::Streaming,
-            refill_config.table_cache_refill_default_policy,
-        )));
         let expected_output = output.object_id;
-        let refiller = CacheRefiller::new(
-            refill_config,
-            refill_store,
-            ReadOnlyRwLockRef::new(cache_metadata.clone()),
-        )
         // Isolate handler publication behind one controlled backend completion.
-        .with_foyer_spawn_task(Arc::new(move |deltas, _| {
-            assert_eq!(
-                deltas
-                    .iter()
-                    .flat_map(|delta| &delta.insert_sst_infos)
-                    .map(|sst| sst.object_id)
-                    .collect::<Vec<_>>(),
-                [expected_output],
-                "Foyer must retain the ordinary projection of a shared Pin object"
-            );
-            let gate = worker_gate.clone();
-            tokio::spawn(async move {
-                gate.acquire().await.unwrap().forget();
-            })
-        }));
-        let mut handler = HummockEventHandler::new_inner(
-            observer_rx,
-            metrics.clone(),
-            RecentVersions::new(initial, 10, metrics.clone()),
-            BufferTracker::from_storage_opts(&options, &metrics),
-            spawn_upload_task,
-            refiller,
-            cache_metadata,
-            pin_membership,
-        );
+        let mut handler = RefillTest::new(
+            Role::Streaming,
+            refill_config,
+            store,
+            Arc::new(move |deltas, _| {
+                assert_eq!(
+                    deltas
+                        .iter()
+                        .flat_map(|delta| &delta.insert_sst_infos)
+                        .map(|sst| sst.object_id)
+                        .collect::<Vec<_>>(),
+                    [expected_output],
+                    "Foyer must retain the ordinary projection of a shared Pin object"
+                );
+                let gate = worker_gate.clone();
+                tokio::spawn(async move {
+                    gate.acquire().await.unwrap().forget();
+                })
+            }),
+            initial,
+        )
+        .handler;
         handler.handle_observer_event(HummockObserverEvent::TableRefillRuntimeConfig(
             risingwave_pb::meta::subscribe_response::Operation::Update,
             PbTableRefillRuntimeConfig {
@@ -1557,7 +1637,7 @@ mod tests {
                     )),
                     GroupDelta::IntraLevel(IntraLevelDelta::new(
                         0,
-                        1,
+                        0,
                         HashSet::new(),
                         vec![output.clone()],
                         0,
@@ -1573,6 +1653,8 @@ mod tests {
         assert!(cache.is_registered(input.object_id));
         assert!(cache.is_registered(output.object_id));
         assert!(cache.get(output.object_id).is_none());
+        let (_observer_tx, observer_rx) = unbounded_channel();
+        handler.observer_event_rx = observer_rx;
         let worker = tokio::spawn(handler.start_hummock_event_handler_worker());
         tokio::time::timeout(Duration::from_secs(1), async {
             while cache.get(output.object_id).is_none() {
@@ -1680,14 +1762,14 @@ mod tests {
                 (internal_table_id, CacheRefillPolicy::Both),
             ])
         );
+        assert_eq!(
+            snapshot.serving_table_vnode_mapping,
+            HashMap::from([(old_table_id, old_vnodes)])
+        );
         // Without a local Pin backend, pin intent must not replace the Foyer policy.
         assert_eq!(
             snapshot.contexts[&internal_table_id].policy,
             CacheRefillPolicy::Both
-        );
-        assert_eq!(
-            snapshot.serving_table_vnode_mapping,
-            HashMap::from([(old_table_id, old_vnodes)])
         );
 
         handler.apply_table_refill_runtime_config(PbTableRefillRuntimeConfig {

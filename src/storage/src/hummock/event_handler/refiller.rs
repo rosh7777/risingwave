@@ -26,13 +26,14 @@ use thiserror_ext::AsReport;
 use tokio::sync::Semaphore;
 
 mod foyer;
-mod metadata;
 mod pin;
 
 use foyer::FoyerRefiller;
-pub(super) use foyer::table_cache_refill_monitor_snapshot;
 #[cfg(test)]
-use foyer::{SpawnRefillTask, default_spawn_refill_task};
+pub(super) use foyer::SpawnRefillTask;
+#[cfg(test)]
+use foyer::default_spawn_refill_task;
+pub(super) use foyer::table_cache_refill_monitor_snapshot;
 pub use foyer::{
     TableCacheRefillContext, TableCacheRefillContextMap, TableCacheRefillMonitorSnapshot,
 };
@@ -42,6 +43,7 @@ use super::ReadOnlyRwLockRef;
 use super::version_update::VersionUpdateCondition;
 use crate::hummock::SstableStoreRef;
 use crate::hummock::local_version::pinned_version::PinnedVersion;
+use crate::hummock::pin_cache_refill::PinCacheRefillPlan;
 use crate::hummock::table_cache_metadata::TableCacheMetadata;
 use crate::opts::StorageOpts;
 
@@ -132,12 +134,10 @@ impl CacheRefiller {
         };
         let pin_cache_refill = sstable_store.pin_cache().map(|_| {
             PinCacheRefiller::new(
+                config.clone(),
                 sstable_store.clone(),
                 metadata,
                 concurrency.clone(),
-                meta_refill_concurrency.clone(),
-                config.pin_cache_max_batch_size,
-                config.timeout,
             )
         });
         let foyer = FoyerRefiller::new(
@@ -160,20 +160,26 @@ impl CacheRefiller {
     }
 
     pub(super) fn start_cache_refill(
-        &mut self,
+        &self,
         deltas: Vec<SstDeltaInfo>,
         new_pinned_version: PinnedVersion,
         version_deltas: Option<&[HummockVersionDelta]>,
         metadata: &TableCacheMetadata,
     ) -> VersionUpdateCondition {
-        let pin = self
-            .pin_cache_refill
-            .as_mut()
-            .map(|refiller| refiller.submit(&deltas, new_pinned_version, version_deltas, metadata));
+        let pin = self.pin_cache_refill.as_ref().map(|refiller| {
+            let plan = PinCacheRefillPlan::from_version_update(
+                &deltas,
+                &new_pinned_version,
+                version_deltas,
+                metadata.pinned_tables(),
+            );
+            refiller.submit(plan, new_pinned_version)
+        });
         let foyer = self.foyer.start_cache_refill(deltas, metadata);
         async move {
             match pin {
-                Some(pin) => futures::join!(foyer, pin).1,
+                // Owner shutdown closes receivers and drops their publication queue together.
+                Some(pin) => futures::join!(foyer, pin).1.unwrap_or(true),
                 None => {
                     foyer.await;
                     true
@@ -183,13 +189,13 @@ impl CacheRefiller {
         .boxed()
     }
 
-    pub(super) fn on_metadata_changed(
+    pub(super) fn invalidate_pin_refills(
         &self,
-        tables: &HashSet<TableId>,
-        metadata: &TableCacheMetadata,
+        changed_tables: &HashSet<TableId>,
+        pinned_tables: &HashSet<TableId>,
     ) {
         if let Some(refiller) = &self.pin_cache_refill {
-            refiller.on_metadata_changed(tables, metadata);
+            refiller.invalidate_refills(changed_tables, pinned_tables);
         }
     }
 
@@ -204,6 +210,6 @@ impl CacheRefiller {
 }
 
 #[cfg(test)]
-mod test_utils;
+pub(super) mod test_utils;
 #[cfg(test)]
 mod tests;

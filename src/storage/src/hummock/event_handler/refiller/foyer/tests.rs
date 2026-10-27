@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::FutureExt;
 use parking_lot::Mutex;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::config::Role;
@@ -94,14 +93,14 @@ impl DataRefillGeneratorTestFixture {
             meta_refill_concurrency: None,
             concurrency: Arc::new(Semaphore::new(1)),
             sstable_store: self.sstable_store.clone(),
-            table_cache_refill_context_map: Arc::new(HashMap::from([(
+            table_cache_refill_context_map: HashMap::from([(
                 self.table_id,
                 TableCacheRefillContext {
                     streaming_vnode_bitmap,
                     serving_vnode_bitmap,
                     policy,
                 },
-            )])),
+            )]),
         }
     }
 
@@ -227,29 +226,21 @@ fn test_table_cache_refill_contexts_by_role_and_policy() {
     let streaming_vnodes = Bitmap::from_indices(VirtualNode::COUNT_FOR_TEST, [1, 3]);
     let serving_vnodes = Bitmap::from_indices(VirtualNode::COUNT_FOR_TEST, [2, 4]);
     for case in cases {
-        let refill_config = test_refill_config(case.default_policy);
-        let cache_metadata = Arc::new(parking_lot::RwLock::new(TableCacheMetadata::new(
-            case.role,
-            refill_config.table_cache_refill_default_policy,
-        )));
+        let mut cache_metadata = TableCacheMetadata::new(case.role, case.default_policy);
 
         if let Some(policy) = case.policy {
             cache_metadata
-                .write()
                 .replace_policy_snapshot(HashMap::from([(table_id, policy)]), HashSet::new());
         }
         if case.has_streaming_vnodes {
-            cache_metadata
-                .write()
-                .update_streaming_table_vnodes(table_id, Some(streaming_vnodes.clone()));
+            cache_metadata.update_streaming_table_vnodes(table_id, Some(streaming_vnodes.clone()));
         }
         if case.has_serving_vnodes {
             cache_metadata
-                .write()
                 .replace_serving_mapping(HashMap::from([(table_id, serving_vnodes.clone())]));
         }
 
-        let contexts = table_cache_refill_contexts(&cache_metadata.read(), [table_id; 3]);
+        let contexts = table_cache_refill_contexts(&cache_metadata, [table_id; 3]);
         let actual = contexts.get(&table_id).map(|context| {
             (
                 context.policy,
@@ -266,8 +257,7 @@ fn test_table_cache_refill_contexts_by_role_and_policy() {
         });
         assert_eq!(actual, expected, "{}", case.name);
         // Ownership comes from the current policy/ownership maps, independently of Foyer policy.
-        let metadata_guard = cache_metadata.read();
-        let ownership = metadata_guard.ownership();
+        let ownership = cache_metadata.ownership();
         assert_eq!(ownership.streaming.is_some(), case.role.for_streaming());
         assert_eq!(ownership.serving.is_some(), case.role.for_serving());
         assert_eq!(
@@ -302,7 +292,7 @@ async fn test_refill_task_captures_runtime_context_snapshot() {
         Role::Serving,
         refill_config.table_cache_refill_default_policy,
     )));
-    let mut refiller = CacheRefiller::new(
+    let refiller = CacheRefiller::new(
         refill_config,
         refill_store,
         ReadOnlyRwLockRef::new(cache_metadata.clone()),
@@ -389,7 +379,7 @@ async fn test_cache_refill_prunes_whole_ssts_before_meta_load() {
             role,
             refill_config.table_cache_refill_default_policy,
         )));
-        let mut refiller = CacheRefiller::new(
+        let refiller = CacheRefiller::new(
             refill_config,
             refill_store,
             ReadOnlyRwLockRef::new(cache_metadata.clone()),
@@ -834,7 +824,7 @@ async fn test_l0_refill_after_truncation_uses_serving_ownership() {
         Role::Serving,
         refill_config.table_cache_refill_default_policy,
     )));
-    let mut refiller = CacheRefiller::new(
+    let refiller = CacheRefiller::new(
         refill_config,
         refill_store,
         ReadOnlyRwLockRef::new(cache_metadata.clone()),
@@ -979,21 +969,19 @@ async fn test_refill_units_do_not_cross_table_projection_boundaries() {
         delta
     });
     let serving_vnodes = Bitmap::ones(VirtualNode::COUNT_FOR_TEST);
-    let table_cache_refill_context_map = Arc::new(
-        [table_a, table_b]
-            .into_iter()
-            .map(|table_id| {
-                (
-                    table_id,
-                    TableCacheRefillContext {
-                        streaming_vnode_bitmap: None,
-                        serving_vnode_bitmap: Some(serving_vnodes.clone()),
-                        policy: CacheRefillPolicy::Serving,
-                    },
-                )
-            })
-            .collect::<TableCacheRefillContextMap>(),
-    );
+    let table_cache_refill_context_map = [table_a, table_b]
+        .into_iter()
+        .map(|table_id| {
+            (
+                table_id,
+                TableCacheRefillContext {
+                    streaming_vnode_bitmap: None,
+                    serving_vnode_bitmap: Some(serving_vnodes.clone()),
+                    policy: CacheRefillPolicy::Serving,
+                },
+            )
+        })
+        .collect::<TableCacheRefillContextMap>();
     let make_context = |unit| {
         let mut config = test_refill_config(CacheRefillPolicy::Disabled);
         config.data_refill_levels.insert(0);
@@ -1096,14 +1084,14 @@ async fn test_scoped_refill_handles_multi_table_vnode_boundary() {
             meta_refill_concurrency: None,
             concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
             sstable_store: sstable_store.clone(),
-            table_cache_refill_context_map: Arc::new(HashMap::from([(
+            table_cache_refill_context_map: HashMap::from([(
                 table_a,
                 TableCacheRefillContext {
                     streaming_vnode_bitmap: Some(streaming_vnodes),
                     serving_vnode_bitmap: None,
                     policy: CacheRefillPolicy::Streaming,
                 },
-            )])),
+            )]),
         };
         DataCacheRefillTaskGenerator {
             context: &context,
@@ -1163,16 +1151,6 @@ async fn test_without_pin_backend_preserves_foyer_task_lifecycle() {
     tokio::time::timeout(Duration::from_secs(1), completed.notified())
         .await
         .expect("dropping the condition must not abort legacy Foyer work");
-
-    let mut condition =
-        refiller.start_cache_refill(vec![], version.clone(), Some(&[]), &cache_metadata.read());
-    assert!(condition.as_mut().now_or_never().is_none());
-    gate.add_permits(1);
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), condition)
-            .await
-            .unwrap()
-    );
 
     refiller.foyer.spawn_refill_task = Some(Arc::new(|_, _| {
         tokio::spawn(async { panic!("simulated Foyer task failure") })

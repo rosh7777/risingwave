@@ -82,7 +82,7 @@ struct Work {
 }
 
 /// Downloads each admitted object once under the shared data concurrency limit.
-/// The Pin refiller loads metadata and checks ownership before submitting a download.
+/// The Pin refiller checks policy and ownership before submitting a download.
 /// Dropping a waiter leaves its copy running; errors finish without background retries.
 pub(crate) struct PinCacheRefillExecutor {
     // Lock order: executor work -> PinCache shard. Never hold work across await.
@@ -113,8 +113,8 @@ impl PinCacheRefillExecutor {
         Self { work, jobs, store }
     }
 
-    /// Submits a gate-deduplicated object after metadata and ownership admission.
-    /// The token must have been captured before asynchronous preparation; do not recapture it.
+    /// Submits a gate-deduplicated object after policy and ownership admission.
+    /// The token identifies that admission; a later revocation must make it obsolete.
     /// Submission is synchronous; the owned future only waits for its result.
     /// True includes published/cached and obsolete work, not a cache-hit guarantee.
     /// False means failure or cancellation, including a duplicate whose previous physical

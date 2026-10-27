@@ -26,7 +26,7 @@ use risingwave_pb::id::TableId;
 
 use super::refill_locality::RefillOwnership;
 
-/// Lock order: metadata, Pin batch state, executor/cache locks. Never hold across I/O or await.
+/// Lock order: metadata, Pin pending queue, executor/cache locks. Never hold across I/O or await.
 pub(crate) type SharedTableCacheMetadata = Arc<RwLock<TableCacheMetadata>>;
 
 pub(crate) struct TableCacheMetadata {
@@ -89,6 +89,8 @@ impl TableCacheMetadata {
         changed
     }
 
+    // Pin admission is table-scoped. Changes within a nonempty local vnode set do not
+    // invalidate downloads; Foyer still consumes the full updated mappings.
     pub(crate) fn replace_serving_mapping(
         &mut self,
         mapping: HashMap<TableId, Bitmap>,
@@ -104,7 +106,7 @@ impl TableCacheMetadata {
         self.pinned_table_ids
             .iter()
             .copied()
-            .filter(|table| before.owned_vnodes(table) != self.ownership().owned_vnodes(table))
+            .filter(|table| before.has_vnodes(table) != self.ownership().has_vnodes(table))
             .collect()
     }
 
@@ -113,22 +115,13 @@ impl TableCacheMetadata {
         table: TableId,
         bitmap: Option<Bitmap>,
     ) -> HashSet<TableId> {
-        let previous = self
-            .is_pinned(&table)
-            .then(|| {
-                self.ownership()
-                    .owned_vnodes(&table)
-                    .map(|bitmap| bitmap.into_owned())
-            })
-            .flatten();
+        let was_owned = self.ownership().has_vnodes(&table);
         if let Some(bitmap) = bitmap {
             self.streaming_table_vnode_mapping.insert(table, bitmap);
         } else {
             self.streaming_table_vnode_mapping.remove(&table);
         }
-        if self.is_pinned(&table)
-            && previous.as_ref() != self.ownership().owned_vnodes(&table).as_deref()
-        {
+        if self.is_pinned(&table) && was_owned != self.ownership().has_vnodes(&table) {
             [table].into()
         } else {
             HashSet::new()

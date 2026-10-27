@@ -79,10 +79,14 @@ use crate::store::*;
 
 struct HummockStorageShutdownGuard {
     shutdown_sender: HummockEventSender,
+    pin_cache_gc: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for HummockStorageShutdownGuard {
     fn drop(&mut self) {
+        if let Some(gc) = &self.pin_cache_gc {
+            gc.abort();
+        }
         let _ = self
             .shutdown_sender
             .send(HummockEvent::Shutdown)
@@ -276,22 +280,24 @@ impl HummockStorage {
             hummock_meta_client.clone(),
             state_store_metrics.clone(),
         ));
+        let shutdown_guard = Arc::new(HummockStorageShutdownGuard {
+            shutdown_sender: event_tx.clone(),
+            pin_cache_gc: sstable_store.pin_cache().map(|cache| cache.start_gc()),
+        });
         let instance = Self {
             context: compactor_context,
             compaction_catalog_manager_ref: compaction_catalog_manager_ref.clone(),
             object_id_manager,
             buffer_tracker: hummock_event_handler.buffer_tracker().clone(),
             version_update_notifier_tx: hummock_event_handler.version_update_notifier_tx(),
-            hummock_event_sender: event_tx.clone(),
+            hummock_event_sender: event_tx,
             _observer_event_sender: observer_event_tx,
             recent_versions: hummock_event_handler.recent_versions(),
             hummock_version_reader: HummockVersionReader::new(
                 sstable_store,
                 state_store_metrics.clone(),
             ),
-            _shutdown_guard: Arc::new(HummockStorageShutdownGuard {
-                shutdown_sender: event_tx,
-            }),
+            _shutdown_guard: shutdown_guard,
             read_version_mapping: hummock_event_handler.read_version_mapping(),
             backup_reader,
             write_limiter,
@@ -1139,5 +1145,42 @@ impl HummockStorage {
             .send(HummockEvent::FlushEvent(tx))
             .expect("flush event should succeed");
         rx.await.expect("flush event receiver dropped");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_storage_shutdown_cancels_pin_gc_before_and_after_first_poll() {
+        for poll in [false, true] {
+            let metrics = HummockStateStoreMetrics::unused();
+            let (shutdown_sender, _receiver) =
+                crate::hummock::event_handler::hummock_event_handler::event_channel(
+                    metrics.event_handler_pending_event,
+                );
+            let (started, started_rx) = oneshot::channel();
+            let (finished, finished_rx) = oneshot::channel();
+            let cleanup = scopeguard::guard(finished, |sender| {
+                let _ = sender.send(());
+            });
+            let gc = tokio::spawn(async move {
+                let _cleanup = cleanup;
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+            if poll {
+                started_rx.await.unwrap();
+            }
+            drop(HummockStorageShutdownGuard {
+                shutdown_sender,
+                pin_cache_gc: Some(gc),
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

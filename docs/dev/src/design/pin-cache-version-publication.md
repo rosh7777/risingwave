@@ -34,8 +34,10 @@ cancels submitted attempts through the executor; it does not update metadata or
 membership.
 Vnode changes do not sweep published files. Version retirement and Pin-policy
 withdrawal unregister objects through the existing backend. Ownership-driven
-reclamation and periodic physical GC scheduling are separate work; this PR does
-not guarantee reclamation when only vnode ownership changes.
+reclamation is separate work; this PR does not guarantee reclamation when only
+vnode ownership changes. After recovery, a storage-owned GC worker runs one full
+pass for startup garbage and periodic minor passes for withdrawn files whose
+readers have exited. Storage shutdown aborts this worker.
 
 The metadata lock never covers I/O or an await. Policy/vnode replacement, membership
 policy rebuild and cancellation share its writer guard so admission cannot observe

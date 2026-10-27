@@ -30,7 +30,6 @@ itertools = { workspace = true }
 madsim = { workspace = true }
 opendal = { workspace = true, features = [
     "executors-tokio",
-    "layers-prometheus",
     "services-azblob",
     "services-fs",
     "services-gcs",

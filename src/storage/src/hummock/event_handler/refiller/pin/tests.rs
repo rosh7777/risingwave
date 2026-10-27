@@ -24,12 +24,13 @@ use risingwave_common::util::epoch::test_epoch;
 use risingwave_hummock_sdk::compaction_group::group_split::split_sst_with_table_ids;
 use risingwave_pb::id::TableId;
 
-use super::super::default_spawn_refill_task;
 use super::super::test_utils::{
     RefillTest, apply_next_events, gen_test_sst_with_object_id, l0_insert_delta,
     mock_sstable_store_with_pin_cache, pinned_version_with_ssts, test_refill_config,
     wait_for_pin_downloads,
 };
+use super::super::{SstDeltaInfo, default_spawn_refill_task};
+use super::PinCacheRefillPlan;
 use crate::hummock::test_utils::gen_test_sstable_with_table_vnodes;
 
 #[tokio::test]
@@ -112,60 +113,140 @@ async fn test_pin_admission_uses_logical_tables_and_current_ownership() {
 
 #[tokio::test]
 async fn test_pin_owner_drop() {
-    let table = TableId::from(233);
-    let (store, cache) = mock_sstable_store_with_pin_cache().await;
-    let (_, info) = gen_test_sst_with_object_id(table, store.clone(), 875).await;
-    let (_, queued) = gen_test_sst_with_object_id(table, store.clone(), 876).await;
-    let object = info.object_id;
-    let weak_store = Arc::downgrade(&store);
-    let base = pinned_version_with_ssts(&[table], &[]);
-    let mut refiller = RefillTest::new(
-        Role::Streaming,
-        test_refill_config(CacheRefillPolicy::Disabled),
-        store,
-        default_spawn_refill_task(),
-        base.clone(),
-    );
-    refiller.replace_table_cache_refill_runtime_snapshot(HashMap::new(), [table].into());
-    refiller.update_streaming_table_vnodes(table, Some(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)));
-    let permit = refiller
-        .cache()
-        .foyer
-        .concurrency
-        .clone()
-        .acquire_owned()
-        .await
-        .unwrap();
-    refiller.submit(vec![l0_insert_delta(1.into(), test_epoch(1), vec![info])]);
-    refiller.submit(vec![l0_insert_delta(
-        2.into(),
-        test_epoch(2),
-        vec![queued.clone()],
-    )]);
-    let pin = refiller.cache().pin_cache_refill.as_ref().unwrap();
-    assert!(
-        cache.is_registered(queued.object_id),
-        "received membership is registered before waiting for I/O"
-    );
-    assert!(pin.executor.has_pending_for_test(object));
-    assert!(pin.executor.has_pending_for_test(queued.object_id));
-    drop(refiller);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while weak_store.upgrade().is_some() {
-            tokio::task::yield_now().await;
+    for submitted in [false, true] {
+        let table = TableId::from(233);
+        let (store, cache) = mock_sstable_store_with_pin_cache().await;
+        let (_, info) = gen_test_sst_with_object_id(table, store.clone(), 875).await;
+        let (_, queued) = gen_test_sst_with_object_id(table, store.clone(), 876).await;
+        let object = info.object_id;
+        let weak_store = Arc::downgrade(&store);
+        let base = pinned_version_with_ssts(&[table], &[]);
+        let mut refiller = RefillTest::new(
+            Role::Streaming,
+            test_refill_config(CacheRefillPolicy::Disabled),
+            store,
+            default_spawn_refill_task(),
+            base.clone(),
+        );
+        refiller.replace_table_cache_refill_runtime_snapshot(HashMap::new(), [table].into());
+        refiller
+            .update_streaming_table_vnodes(table, Some(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)));
+        let permit = refiller
+            .cache()
+            .foyer
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let weak_executor =
+            Arc::downgrade(&refiller.cache().pin_cache_refill.as_ref().unwrap().executor);
+        refiller.submit(vec![l0_insert_delta(1.into(), test_epoch(1), vec![info])]);
+        if submitted {
+            wait_for_pin_downloads(&refiller, &[object]).await;
         }
-    })
-    .await
-    .expect("owner drop must release submitted work even without polling publication");
-    assert!(cache.get(object).is_none());
-    assert!(cache.get(queued.object_id).is_none());
-    drop(permit);
+        refiller.submit(vec![l0_insert_delta(
+            2.into(),
+            test_epoch(2),
+            vec![queued.clone()],
+        )]);
+        let worker = refiller.cache().pin_cache_refill.as_ref().unwrap();
+        assert_eq!(worker.pending.lock().len(), if submitted { 1 } else { 2 });
+        assert!(
+            cache.is_registered(queued.object_id),
+            "received membership is registered while refill intent remains queued"
+        );
+        assert_eq!(worker.executor.has_pending_for_test(object), submitted);
+        drop(refiller);
+        assert!(
+            weak_executor.upgrade().is_none(),
+            "the batch waiter must not retain the executor owner"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_store.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner drop must release pending and submitted work");
+        assert!(cache.get(object).is_none());
+        assert!(cache.get(queued.object_id).is_none());
+        drop(permit);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_selected_batch_endpoint_on_timeout_or_revocation() {
+    for revoke_ownership in [false, true] {
+        let table = TableId::from(233);
+        let (store, cache) = mock_sstable_store_with_pin_cache().await;
+        let (_, first_sst) = gen_test_sst_with_object_id(table, store.clone(), 877).await;
+        let first_target = pinned_version_with_ssts(&[table], std::slice::from_ref(&first_sst));
+        let mut last_version = (*first_target).clone();
+        last_version.id = 2.into();
+        let last_target = first_target.new_with_local_version(last_version).unwrap();
+        let mut config = test_refill_config(CacheRefillPolicy::Disabled);
+        config.timeout = Duration::from_secs(if revoke_ownership { 60 } else { 1 });
+        let mut refiller = RefillTest::new(
+            Role::Streaming,
+            config,
+            store,
+            default_spawn_refill_task(),
+            pinned_version_with_ssts(&[table], &[]),
+        );
+        refiller.replace_table_cache_refill_runtime_snapshot(HashMap::new(), [table].into());
+        refiller
+            .update_streaming_table_vnodes(table, Some(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)));
+        let _permit = refiller
+            .cache()
+            .foyer
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let object = first_sst.object_id;
+        // Register received membership as the handler does before backend submission.
+        cache.register_objects([first_sst.object_id]);
+        let pin = refiller.cache().pin_cache_refill.as_ref().unwrap();
+        let first = {
+            let metadata = refiller.metadata().read();
+            let plan = PinCacheRefillPlan::from_version_update(
+                &[SstDeltaInfo {
+                    insert_sst_infos: vec![first_sst],
+                    ..Default::default()
+                }],
+                &first_target,
+                Some(&[]),
+                metadata.pinned_tables(),
+            );
+            pin.submit(plan, first_target)
+        };
+        // Empty intent still belongs to the selected batch and supplies its endpoint.
+        let last = pin.submit(PinCacheRefillPlan::default(), last_target);
+        wait_for_pin_downloads(&refiller, &[object]).await;
+        if revoke_ownership {
+            refiller.update_streaming_table_vnodes(table, None);
+        } else {
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let endpoints =
+            tokio::time::timeout(Duration::from_secs(1), async { (first.await, last.await) })
+                .await
+                .unwrap();
+        assert_eq!(
+            endpoints,
+            (Ok(false), Ok(true)),
+            "revoke_ownership={revoke_ownership}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn test_pin_changes_after_submission() {
+async fn test_pin_changes_before_and_after_submission() {
     #[derive(Clone, Copy, Debug)]
     enum Change {
+        PendingOwnership,
         Policy,
         Ownership,
         EquivalentLane,
@@ -173,6 +254,7 @@ async fn test_pin_changes_after_submission() {
         NewOwnership,
     }
     for change in [
+        Change::PendingOwnership,
         Change::Policy,
         Change::Ownership,
         Change::EquivalentLane,
@@ -198,7 +280,7 @@ async fn test_pin_changes_after_submission() {
             tables[0],
             Some(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)),
         );
-        if !matches!(change, Change::NewOwnership) {
+        if !matches!(change, Change::NewOwnership | Change::PendingOwnership) {
             refiller.update_streaming_table_vnodes(
                 tables[1],
                 Some(Bitmap::ones(VirtualNode::COUNT_FOR_TEST)),
@@ -213,7 +295,9 @@ async fn test_pin_changes_after_submission() {
             .await
             .unwrap();
         refiller.submit(vec![l0_insert_delta(1.into(), test_epoch(1), vec![info])]);
-        wait_for_pin_downloads(&refiller, &[object]).await;
+        if !matches!(change, Change::PendingOwnership) {
+            wait_for_pin_downloads(&refiller, &[object]).await;
+        }
         let original_token = cache.prepare_refill(object);
         match change {
             Change::EquivalentLane => {
@@ -234,7 +318,9 @@ async fn test_pin_changes_after_submission() {
                 .replace_table_cache_refill_runtime_snapshot(HashMap::new(), [tables[1]].into()),
             // These updates represent the union after read-version registration/destruction,
             // not an in-place rescale of a retained actor.
-            Change::Ownership => refiller.update_streaming_table_vnodes(tables[0], None),
+            Change::Ownership | Change::PendingOwnership => {
+                refiller.update_streaming_table_vnodes(tables[0], None)
+            }
         }
         let cancelled = matches!(change, Change::Policy | Change::Ownership);
         if cancelled {
@@ -270,6 +356,10 @@ async fn test_pin_changes_after_submission() {
         })
         .await
         .unwrap();
-        assert_eq!(cache.get(object).is_some(), !cancelled, "{change:?}");
+        assert_eq!(
+            cache.get(object).is_some(),
+            !cancelled && !matches!(change, Change::PendingOwnership),
+            "{change:?}"
+        );
     }
 }

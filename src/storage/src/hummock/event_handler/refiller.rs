@@ -39,6 +39,7 @@ pub use foyer::{
 };
 use pin::PinCacheRefiller;
 
+use super::ReadOnlyRwLockRef;
 use super::version_update::VersionUpdateCondition;
 use crate::hummock::SstableStoreRef;
 use crate::hummock::local_version::pinned_version::PinnedVersion;
@@ -48,8 +49,11 @@ use crate::opts::StorageOpts;
 
 #[derive(Debug)]
 pub struct CacheRefillConfig {
-    /// Timeout for each backend refill attempt, starting at event submission.
+    /// Timeout for each backend refill attempt, excluding pending Pin batches.
     pub timeout: Duration,
+
+    /// Maximum version events merged into one Pin Cache refill batch.
+    pub pin_cache_max_batch_size: usize,
 
     /// Data file cache refill levels.
     pub data_refill_levels: HashSet<u32>,
@@ -94,6 +98,7 @@ impl CacheRefillConfig {
 
         Self {
             timeout: Duration::from_millis(options.cache_refill_timeout_ms),
+            pin_cache_max_batch_size: options.cache_refill_pin_cache_max_batch_size.max(1),
             data_refill_levels,
             concurrency: options.cache_refill_concurrency,
             meta_refill_concurrency: options.cache_refill_meta_refill_concurrency,
@@ -115,7 +120,11 @@ pub(crate) struct CacheRefiller {
 }
 
 impl CacheRefiller {
-    pub(crate) fn new(config: CacheRefillConfig, sstable_store: SstableStoreRef) -> Self {
+    pub(crate) fn new(
+        config: CacheRefillConfig,
+        sstable_store: SstableStoreRef,
+        metadata: ReadOnlyRwLockRef<TableCacheMetadata>,
+    ) -> Self {
         let config = Arc::new(config);
         let concurrency = Arc::new(Semaphore::new(config.concurrency));
         let meta_refill_concurrency = if config.meta_refill_concurrency == 0 {
@@ -123,9 +132,14 @@ impl CacheRefiller {
         } else {
             Some(Arc::new(Semaphore::new(config.meta_refill_concurrency)))
         };
-        let pin_cache_refill = sstable_store
-            .pin_cache()
-            .map(|_| PinCacheRefiller::new(&config, sstable_store.clone(), concurrency.clone()));
+        let pin_cache_refill = sstable_store.pin_cache().map(|_| {
+            PinCacheRefiller::new(
+                config.clone(),
+                sstable_store.clone(),
+                metadata,
+                concurrency.clone(),
+            )
+        });
         let foyer = FoyerRefiller::new(
             config,
             sstable_store,
@@ -159,22 +173,29 @@ impl CacheRefiller {
                 version_deltas,
                 metadata.pinned_tables(),
             );
-            refiller.start_cache_refill(plan, metadata)
+            refiller.submit(plan, new_pinned_version)
         });
         let foyer = self.foyer.start_cache_refill(deltas, metadata);
         async move {
-            if let Some(pin) = pin {
-                futures::join!(foyer, pin);
-            } else {
-                foyer.await;
+            match pin {
+                // Owner shutdown closes receivers and drops their publication queue together.
+                Some(pin) => futures::join!(foyer, pin).1.unwrap_or(true),
+                None => {
+                    foyer.await;
+                    true
+                }
             }
         }
         .boxed()
     }
 
-    pub(super) fn invalidate_pin_refills(&self, changed_tables: &HashSet<TableId>) {
+    pub(super) fn invalidate_pin_refills(
+        &self,
+        changed_tables: &HashSet<TableId>,
+        pinned_tables: &HashSet<TableId>,
+    ) {
         if let Some(refiller) = &self.pin_cache_refill {
-            refiller.invalidate_refills(changed_tables);
+            refiller.invalidate_refills(changed_tables, pinned_tables);
         }
     }
 
